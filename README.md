@@ -45,9 +45,9 @@ How to enable sieve filters in the Fastpanel
   6. Edit /usr/share/fastpanel2-roundcube/config/config.inc.php for adding the megasieve plugin to the Roundcube
 
         $config['plugins'] = [
-                      \'archive\',
-                      \'zipdownload\',
-                      \'managesieve\',
+                      'archive',
+                      'zipdownload',
+                      'managesieve',
                         ];
   
   7. Add this settings to the /etc/exim4/exim4.conf.template in #the transports configuration
