@@ -1,0 +1,740 @@
+SA_ENABLE = yes
+### Spamassassin path and user
+
+SA_SPAMD_USER = debian-spamd
+SA_ABUSE_ADDR = The System Administrator
+.ifdef SA_ENABLE
+    spamd_address = /var/run/spamd_socket
+.endif
+
+### Main config
+# Variables
+EXIM_PASSWD  = /etc/exim4/passwd
+EXIM_DOMAINS = /etc/exim4/domains
+EXIM_ALIASES = /etc/exim4/aliases
+EXIM_DOMAINIPS = /etc/exim4/domainips
+
+# TLS/SSL
+tls_advertise_hosts = *
+tls_certificate = ${if exists{/etc/exim4/ssl/${tls_sni}.crt}{/etc/exim4/ssl/${tls_sni}.crt}{/etc/exim4/ssl/exim.crt}}
+tls_privatekey = ${if exists{/etc/exim4/ssl/${tls_sni}.key}{/etc/exim4/ssl/${tls_sni}.key}{/etc/exim4/ssl/exim.key}}
+
+daemon_smtp_ports = 25 : 465 : 587
+tls_on_connect_ports = 465
+
+# DKIM:
+DKIM_DOMAIN                     = ${lc:${domain:$h_from:}}
+DKIM_FILE                       = /etc/exim4/dkim/DKIM_DOMAIN.private
+DKIM_PRIVATE_KEY                = ${if exists{DKIM_FILE}{/etc/exim4/dkim/${lookup {DKIM_DOMAIN.private} dsearch {/etc/exim4/dkim/}}}{0}}
+
+# Specifically keep environment to avoid warnings
+keep_environment =
+
+# Logging
+log_selector =  \
+    +all_parents \
+    +lost_incoming_connection \
+    +received_sender \
+    +received_recipients \
+    +tls_cipher +tls_peerdn +tls_sni \
+    +smtp_confirmation \
+    +smtp_syntax_error \
+    +smtp_protocol_error
+
+# Set fastmail user and group as trusted
+trusted_groups = fastmail
+trusted_users = fastmail
+
+# Allow all users to define sender headers
+untrusted_set_sender = *
+
+
+# Set source of local domains
+domainlist local_domains = lsearch;EXIM_DOMAINS
+
+# Allow relay only from localhost or to local domains
+hostlist relay_from_hosts = 127.0.0.1
+domainlist relay_to_domains = lsearch;EXIM_DOMAINS
+
+# User/group for exim processes
+exim_user = Debian-exim
+exim_group = Debian-exim
+
+# Forbid delivery as root
+never_users = root
+
+# Perform reverse DNS lookup for incoming connections
+host_lookup = *
+
+# Disable RFC 1413 (ident callbacks)
+rfc1413_hosts = *
+rfc1413_query_timeout = 0s
+
+# Queue timeouts
+ignore_bounce_errors_after = 2d
+timeout_frozen_after = 7d
+
+# Declare our ACL
+acl_not_smtp = acl_check_not_smtp
+acl_smtp_rcpt = acl_check_rcpt
+acl_smtp_dkim = acl_check_dkim
+acl_smtp_data = acl_check_data
+
+# Start ACL definition
+begin acl
+
+    # Check non-smtp, i.e. php_mail()
+    acl_check_not_smtp:
+        accept
+
+    # Check on RCPT step
+    acl_check_rcpt:
+        # Allows any rcpt from local SMTP connection
+        accept
+            hosts = :
+
+        deny
+            message = unauthenticated local mail prohibited
+            !authenticated = *
+            hosts = !+relay_from_hosts
+            sender_domains = +local_domains
+
+        # Set restricted characters (leaving defaults)
+        deny
+            message = restricted characters in address
+            domains = +local_domains
+            local_parts = ^[.] : ^.*[@%!/|]
+
+        deny
+            message = restricted characters in address
+            domains = !+local_domains
+            local_parts = ^[./|] : ^.*[@%!] : ^.*/\\.\\./
+
+        # Accept mail to postmaster and abuse on local domains
+        accept
+            local_parts = postmaster : abuse
+            domains = +local_domains
+
+        # Verify sender using routers
+        require
+            message = can't verify sender
+            verify = sender
+
+        # Treat messages from allowed hosts as local and do not change sender headers
+        accept
+            hosts = +relay_from_hosts
+            control = submission/sender_retain
+
+        # Treat authenticated messages as local and use username in From: (if it is not set)
+        accept
+            authenticated = *
+            control = submission/domain=
+
+        # Forbid relay except for local and our relay domains
+        require
+            message = relay not permitted
+            domains = +local_domains : +relay_to_domains
+
+        # Verify recipient using routers
+        require
+            message = can't verify recipient
+            verify = recipient
+
+        # Accept all messages that were not rejected earlier
+        accept
+
+    # Check DKIM
+    acl_check_dkim:
+        warn
+            dkim_status = fail
+            add_header = X-DKIM-FAIL: DKIM test failed: (address=$sender_address domain=$dkim_cur_signer), signature is bad.
+            log_message = DKIM test failed: $dkim_verify_reason
+
+        warn
+            dkim_status = invalid
+            add_header = :at_start:Authentication-Results: $primary_hostname;\n $dkim_cur_signer ($dkim_verify_status); $dkim_verify_reason
+            log_message = DKIM test passed (address=$sender_address domain=$dkim_cur_signer), but signature is invalid.
+
+        accept
+            dkim_status = pass
+            add_header = :at_start:Authentication-Results: $primary_hostname;\n dkim=$dkim_verify_status, header.i=@$dkim_cur_signer
+            log_message = DKIM test passed (address=$sender_address domain=$dkim_cur_signer), good signature.
+
+        accept
+
+    # Check headers if we have SA enabled
+    acl_check_data:
+        .ifdef SA_ENABLE
+        # Deny message if is is detected as spam by spamd and user set to deny spam
+        deny
+            message = spam message detected by Spamassassin with Spam_score: $spam_score
+            !authenticated = *
+            hosts = !127.0.0.1/24 : !+relay_from_hosts
+            condition = ${if < {$message_size}{1024K}}
+            condition = ${extract{7}{:}{${lookup{$recipients}lsearch{EXIM_PASSWD}}}}
+            spam = SA_SPAMD_USER
+            logwrite = This message was detected as SPAM. More information in syslog.
+
+        # Add X-Spam-Flag if spamd actually detects spam
+        warn
+            !authenticated = *
+            hosts = !127.0.0.1/24 : !+relay_from_hosts
+            condition = ${if < {$message_size}{1024K}}
+            spam = SA_SPAMD_USER
+            add_header = X-Spam-Flag: YES
+            logwrite = This message was detected as SPAM. More information in syslog.
+
+        # Add additional X-Spam headers if check was performed
+        warn
+            !authenticated = *
+            hosts = !127.0.0.1/24 : !+relay_from_hosts
+            condition = ${if < {$message_size}{1024K}}
+            spam = SA_SPAMD_USER:true
+            add_header = X-Spam-score: $spam_score\n\
+                X-Spam-score-int: $spam_score_int\n\
+                X-Spam-bar: $spam_bar\n\
+                X-Spam-report: $spam_report
+            logwrite = From $sender_address to $recipients X-Spam_score: $spam_score.
+
+        .endif
+
+    accept
+
+# Start routers definition
+begin routers
+
+    # Try to pass non-local domains to remote SMTP if we can find MX. Fail and bounce otherwise
+    dnslookup:
+        driver = dnslookup
+        domains = ! +local_domains
+        transport = remote_smtp
+        ignore_target_hosts = 0.0.0.0 : 127.0.0.0/8
+        no_more
+
+    # Try to pass domain disabled in EXIM_DOMAINS to remote SMTP
+    disabled_domains:
+        driver = dnslookup
+        condition = ${extract{3}{:}{${lookup{$domain}lsearch{EXIM_DOMAINS}}}}
+        transport = remote_smtp
+        ignore_target_hosts = 0.0.0.0 : 127.0.0.0/8
+        no_more
+
+    # Fail if user is disabled in EXIM_PASSWD
+    disabled_users:
+        driver = redirect
+        condition = ${extract{5}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+        allow_fail = yes
+        data = :fail: User disabled
+        no_more
+
+    # Define aliases
+    aliases:
+        driver = redirect
+        condition = ${if exists{EXIM_ALIASES} {yes} {no} }
+        data = ${extract{1}{:}{${lookup{$local_part@$domain}lsearch{EXIM_ALIASES}}}}
+        redirect_router = dnslookup
+        pipe_transport = address_pipe
+
+    # Deliver all addresses found in EXIM_PASSWD locally
+    # But to Junk if it looks like spam
+    local_spam:
+        no_verify
+        driver = accept
+        transport = local_spamdir
+        condition = ${if and{ {def:h_X-Spam-Flag:}{eq {$h_X-Spam-Flag:}{YES}} } {yes} {no} }
+        condition = ${lookup {$local_part@$domain} lsearch {EXIM_PASSWD} {yes} {no} }
+
+    local_users:
+        driver = accept
+#        transport = local_maildir
+        transport = dovecot
+        condition = ${lookup {$local_part@$domain} lsearch {EXIM_PASSWD} {yes} {no} }
+
+
+    # Redirect all mails for unexistent users for configured address if set in EXIM_DOMAINS
+    catchall_for_domains:
+        driver = redirect
+        headers_add = X-redirected: yes
+        data = ${extract{2}{:}{${lookup{$domain}lsearch{EXIM_DOMAINS}}}}
+        redirect_router = dnslookup
+
+    # Bounce all that did not match previous routers with '550 Unknown user'
+    unknown_users:
+        driver = redirect
+        allow_fail = yes
+        data = :fail: Unknown user
+        no_more
+
+
+
+# Start transports configuration
+begin transports
+
+    # Remote SMTP sender using IP from EXIM_DOMAINIPS per domain
+    remote_smtp:
+        driver = smtp
+        dkim_domain           = DKIM_DOMAIN
+        dkim_selector         = dkim
+        dkim_private_key      = DKIM_PRIVATE_KEY
+        interface = <;${lookup{$sender_address_domain}lsearch{EXIM_DOMAINIPS}}
+
+    # Local delivery transport based on EXIM_PASSWD (uses paths, uid/gui, quotes)
+    local_maildir:
+        driver = appendfile
+        maildir_format = true
+        maildir_use_size_file = true
+        create_directory = true
+        directory_mode = 700
+        directory = ${extract{4}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}/.maildir
+        delivery_date_add
+        envelope_to_add
+        return_path_add
+        mode = 0660
+        quota = ${extract{3}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}M
+        quota_warn_threshold = 75%
+        use_lockfile = no
+        no_mode_fail_narrower
+        user = ${extract{1}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+        group = ${extract{2}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+
+    local_spamdir:
+        driver = appendfile
+        maildir_format = true
+        maildir_use_size_file = true
+        create_directory = true
+        directory_mode = 700
+        directory = ${extract{4}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}/.maildir/.Junk
+        delivery_date_add
+        envelope_to_add
+        return_path_add
+        mode = 0660
+        quota = ${extract{3}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}M
+        quota_warn_threshold = 75%
+        use_lockfile = no
+        no_mode_fail_narrower
+        user = ${extract{1}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+        group = ${extract{2}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+
+
+    # Pipe transport for custom aliases
+    address_pipe:
+        driver = pipe
+        ignore_status
+        return_output
+        use_shell
+
+    # LDA dovecot
+    dovecot:
+	driver = pipe
+	command = /usr/lib/dovecot/dovecot-lda -e -d $local_part@$domain -f $sender_address -a $original_local_part@$original_domain
+	return_path_add
+	log_output = true
+	delivery_date_add
+	envelope_to_add
+	user = ${extract{1}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+	group = ${extract{2}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+	return_output
+
+
+
+# Resend rules
+begin retry
+
+# Resend every 15 min for 2 hours, then at intervals starting at one hour and increasing by a factor of 1.5 until 16 hours have passed, then every 6 hours up to 4 days. After 4 days mail bounces.
+*   *   F,2h,15m; G,16h,1h,1.5; F,4d,6h
+
+# Default empty rewrite rules
+begin rewrite
+
+# Authentificators
+begin authenticators
+
+    # Dovecot LOGIN
+    dovecot_login:
+        driver = dovecot
+        public_name = LOGIN
+        server_socket = /var/run/dovecot/auth-client
+        server_set_id = $auth1
+
+    # Dovecot PLAIN
+    dovecot_plain:
+        driver = dovecot
+        public_name = PLAIN
+        server_socket = /var/run/dovecot/auth-client
+        server_set_id = $auth1
+root@vmi1789173:/etc/exim4# routers definition
+routers: command not found
+root@vmi1789173:/etc/exim4# 
+root@vmi1789173:/etc/exim4# 
+root@vmi1789173:/etc/exim4# 
+root@vmi1789173:/etc/exim4# 
+root@vmi1789173:/etc/exim4# 
+root@vmi1789173:/etc/exim4# 
+root@vmi1789173:/etc/exim4# 
+root@vmi1789173:/etc/exim4# 
+root@vmi1789173:/etc/exim4# 
+root@vmi1789173:/etc/exim4# cat exim4.conf.template 
+SA_ENABLE = yes
+### Spamassassin path and user
+
+SA_SPAMD_USER = debian-spamd
+SA_ABUSE_ADDR = The System Administrator
+.ifdef SA_ENABLE
+    spamd_address = /var/run/spamd_socket
+.endif
+
+### Main config
+# Variables
+EXIM_PASSWD  = /etc/exim4/passwd
+EXIM_DOMAINS = /etc/exim4/domains
+EXIM_ALIASES = /etc/exim4/aliases
+EXIM_DOMAINIPS = /etc/exim4/domainips
+
+# TLS/SSL
+tls_advertise_hosts = *
+tls_certificate = ${if exists{/etc/exim4/ssl/${tls_sni}.crt}{/etc/exim4/ssl/${tls_sni}.crt}{/etc/exim4/ssl/exim.crt}}
+tls_privatekey = ${if exists{/etc/exim4/ssl/${tls_sni}.key}{/etc/exim4/ssl/${tls_sni}.key}{/etc/exim4/ssl/exim.key}}
+
+daemon_smtp_ports = 25 : 465 : 587
+tls_on_connect_ports = 465
+
+# DKIM:
+DKIM_DOMAIN                     = ${lc:${domain:$h_from:}}
+DKIM_FILE                       = /etc/exim4/dkim/DKIM_DOMAIN.private
+DKIM_PRIVATE_KEY                = ${if exists{DKIM_FILE}{/etc/exim4/dkim/${lookup {DKIM_DOMAIN.private} dsearch {/etc/exim4/dkim/}}}{0}}
+
+# Specifically keep environment to avoid warnings
+keep_environment =
+
+# Logging
+log_selector =  \
+    +all_parents \
+    +lost_incoming_connection \
+    +received_sender \
+    +received_recipients \
+    +tls_cipher +tls_peerdn +tls_sni \
+    +smtp_confirmation \
+    +smtp_syntax_error \
+    +smtp_protocol_error
+
+# Set fastmail user and group as trusted
+trusted_groups = fastmail
+trusted_users = fastmail
+
+# Allow all users to define sender headers
+untrusted_set_sender = *
+
+
+# Set source of local domains
+domainlist local_domains = lsearch;EXIM_DOMAINS
+
+# Allow relay only from localhost or to local domains
+hostlist relay_from_hosts = 127.0.0.1
+domainlist relay_to_domains = lsearch;EXIM_DOMAINS
+
+# User/group for exim processes
+exim_user = Debian-exim
+exim_group = Debian-exim
+
+# Forbid delivery as root
+never_users = root
+
+# Perform reverse DNS lookup for incoming connections
+host_lookup = *
+
+# Disable RFC 1413 (ident callbacks)
+rfc1413_hosts = *
+rfc1413_query_timeout = 0s
+
+# Queue timeouts
+ignore_bounce_errors_after = 2d
+timeout_frozen_after = 7d
+
+# Declare our ACL
+acl_not_smtp = acl_check_not_smtp
+acl_smtp_rcpt = acl_check_rcpt
+acl_smtp_dkim = acl_check_dkim
+acl_smtp_data = acl_check_data
+
+# Start ACL definition
+begin acl
+
+    # Check non-smtp, i.e. php_mail()
+    acl_check_not_smtp:
+        accept
+
+    # Check on RCPT step
+    acl_check_rcpt:
+        # Allows any rcpt from local SMTP connection
+        accept
+            hosts = :
+
+        deny
+            message = unauthenticated local mail prohibited
+            !authenticated = *
+            hosts = !+relay_from_hosts
+            sender_domains = +local_domains
+
+        # Set restricted characters (leaving defaults)
+        deny
+            message = restricted characters in address
+            domains = +local_domains
+            local_parts = ^[.] : ^.*[@%!/|]
+
+        deny
+            message = restricted characters in address
+            domains = !+local_domains
+            local_parts = ^[./|] : ^.*[@%!] : ^.*/\\.\\./
+
+        # Accept mail to postmaster and abuse on local domains
+        accept
+            local_parts = postmaster : abuse
+            domains = +local_domains
+
+        # Verify sender using routers
+        require
+            message = can't verify sender
+            verify = sender
+
+        # Treat messages from allowed hosts as local and do not change sender headers
+        accept
+            hosts = +relay_from_hosts
+            control = submission/sender_retain
+
+        # Treat authenticated messages as local and use username in From: (if it is not set)
+        accept
+            authenticated = *
+            control = submission/domain=
+
+        # Forbid relay except for local and our relay domains
+        require
+            message = relay not permitted
+            domains = +local_domains : +relay_to_domains
+
+        # Verify recipient using routers
+        require
+            message = can't verify recipient
+            verify = recipient
+
+        # Accept all messages that were not rejected earlier
+        accept
+
+    # Check DKIM
+    acl_check_dkim:
+        warn
+            dkim_status = fail
+            add_header = X-DKIM-FAIL: DKIM test failed: (address=$sender_address domain=$dkim_cur_signer), signature is bad.
+            log_message = DKIM test failed: $dkim_verify_reason
+
+        warn
+            dkim_status = invalid
+            add_header = :at_start:Authentication-Results: $primary_hostname;\n $dkim_cur_signer ($dkim_verify_status); $dkim_verify_reason
+            log_message = DKIM test passed (address=$sender_address domain=$dkim_cur_signer), but signature is invalid.
+
+        accept
+            dkim_status = pass
+            add_header = :at_start:Authentication-Results: $primary_hostname;\n dkim=$dkim_verify_status, header.i=@$dkim_cur_signer
+            log_message = DKIM test passed (address=$sender_address domain=$dkim_cur_signer), good signature.
+
+        accept
+
+    # Check headers if we have SA enabled
+    acl_check_data:
+        .ifdef SA_ENABLE
+        # Deny message if is is detected as spam by spamd and user set to deny spam
+        deny
+            message = spam message detected by Spamassassin with Spam_score: $spam_score
+            !authenticated = *
+            hosts = !127.0.0.1/24 : !+relay_from_hosts
+            condition = ${if < {$message_size}{1024K}}
+            condition = ${extract{7}{:}{${lookup{$recipients}lsearch{EXIM_PASSWD}}}}
+            spam = SA_SPAMD_USER
+            logwrite = This message was detected as SPAM. More information in syslog.
+
+        # Add X-Spam-Flag if spamd actually detects spam
+        warn
+            !authenticated = *
+            hosts = !127.0.0.1/24 : !+relay_from_hosts
+            condition = ${if < {$message_size}{1024K}}
+            spam = SA_SPAMD_USER
+            add_header = X-Spam-Flag: YES
+            logwrite = This message was detected as SPAM. More information in syslog.
+
+        # Add additional X-Spam headers if check was performed
+        warn
+            !authenticated = *
+            hosts = !127.0.0.1/24 : !+relay_from_hosts
+            condition = ${if < {$message_size}{1024K}}
+            spam = SA_SPAMD_USER:true
+            add_header = X-Spam-score: $spam_score\n\
+                X-Spam-score-int: $spam_score_int\n\
+                X-Spam-bar: $spam_bar\n\
+                X-Spam-report: $spam_report
+            logwrite = From $sender_address to $recipients X-Spam_score: $spam_score.
+
+        .endif
+
+    accept
+
+# Start routers definition
+begin routers
+
+    # Try to pass non-local domains to remote SMTP if we can find MX. Fail and bounce otherwise
+    dnslookup:
+        driver = dnslookup
+        domains = ! +local_domains
+        transport = remote_smtp
+        ignore_target_hosts = 0.0.0.0 : 127.0.0.0/8
+        no_more
+
+    # Try to pass domain disabled in EXIM_DOMAINS to remote SMTP
+    disabled_domains:
+        driver = dnslookup
+        condition = ${extract{3}{:}{${lookup{$domain}lsearch{EXIM_DOMAINS}}}}
+        transport = remote_smtp
+        ignore_target_hosts = 0.0.0.0 : 127.0.0.0/8
+        no_more
+
+    # Fail if user is disabled in EXIM_PASSWD
+    disabled_users:
+        driver = redirect
+        condition = ${extract{5}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+        allow_fail = yes
+        data = :fail: User disabled
+        no_more
+
+    # Define aliases
+    aliases:
+        driver = redirect
+        condition = ${if exists{EXIM_ALIASES} {yes} {no} }
+        data = ${extract{1}{:}{${lookup{$local_part@$domain}lsearch{EXIM_ALIASES}}}}
+        redirect_router = dnslookup
+        pipe_transport = address_pipe
+
+    # Deliver all addresses found in EXIM_PASSWD locally
+    # But to Junk if it looks like spam
+    local_spam:
+        no_verify
+        driver = accept
+        transport = local_spamdir
+        condition = ${if and{ {def:h_X-Spam-Flag:}{eq {$h_X-Spam-Flag:}{YES}} } {yes} {no} }
+        condition = ${lookup {$local_part@$domain} lsearch {EXIM_PASSWD} {yes} {no} }
+
+    local_users:
+        driver = accept
+#        transport = local_maildir
+        transport = dovecot
+        condition = ${lookup {$local_part@$domain} lsearch {EXIM_PASSWD} {yes} {no} }
+
+
+    # Redirect all mails for unexistent users for configured address if set in EXIM_DOMAINS
+    catchall_for_domains:
+        driver = redirect
+        headers_add = X-redirected: yes
+        data = ${extract{2}{:}{${lookup{$domain}lsearch{EXIM_DOMAINS}}}}
+        redirect_router = dnslookup
+
+    # Bounce all that did not match previous routers with '550 Unknown user'
+    unknown_users:
+        driver = redirect
+        allow_fail = yes
+        data = :fail: Unknown user
+        no_more
+
+
+
+# Start transports configuration
+begin transports
+
+    # Remote SMTP sender using IP from EXIM_DOMAINIPS per domain
+    remote_smtp:
+        driver = smtp
+        dkim_domain           = DKIM_DOMAIN
+        dkim_selector         = dkim
+        dkim_private_key      = DKIM_PRIVATE_KEY
+        interface = <;${lookup{$sender_address_domain}lsearch{EXIM_DOMAINIPS}}
+
+    # Local delivery transport based on EXIM_PASSWD (uses paths, uid/gui, quotes)
+    local_maildir:
+        driver = appendfile
+        maildir_format = true
+        maildir_use_size_file = true
+        create_directory = true
+        directory_mode = 700
+        directory = ${extract{4}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}/.maildir
+        delivery_date_add
+        envelope_to_add
+        return_path_add
+        mode = 0660
+        quota = ${extract{3}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}M
+        quota_warn_threshold = 75%
+        use_lockfile = no
+        no_mode_fail_narrower
+        user = ${extract{1}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+        group = ${extract{2}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+
+    local_spamdir:
+        driver = appendfile
+        maildir_format = true
+        maildir_use_size_file = true
+        create_directory = true
+        directory_mode = 700
+        directory = ${extract{4}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}/.maildir/.Junk
+        delivery_date_add
+        envelope_to_add
+        return_path_add
+        mode = 0660
+        quota = ${extract{3}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}M
+        quota_warn_threshold = 75%
+        use_lockfile = no
+        no_mode_fail_narrower
+        user = ${extract{1}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+        group = ${extract{2}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+
+
+    # Pipe transport for custom aliases
+    address_pipe:
+        driver = pipe
+        ignore_status
+        return_output
+        use_shell
+
+    # LDA dovecot
+    dovecot:
+	driver = pipe
+	command = /usr/lib/dovecot/dovecot-lda -e -d $local_part@$domain -f $sender_address -a $original_local_part@$original_domain
+	return_path_add
+	log_output = true
+	delivery_date_add
+	envelope_to_add
+	user = ${extract{1}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+	group = ${extract{2}{:}{${lookup{$local_part@$domain}lsearch{EXIM_PASSWD}}}}
+	return_output
+
+
+
+# Resend rules
+begin retry
+
+# Resend every 15 min for 2 hours, then at intervals starting at one hour and increasing by a factor of 1.5 until 16 hours have passed, then every 6 hours up to 4 days. After 4 days mail bounces.
+*   *   F,2h,15m; G,16h,1h,1.5; F,4d,6h
+
+# Default empty rewrite rules
+begin rewrite
+
+# Authentificators
+begin authenticators
+
+    # Dovecot LOGIN
+    dovecot_login:
+        driver = dovecot
+        public_name = LOGIN
+        server_socket = /var/run/dovecot/auth-client
+        server_set_id = $auth1
+
+    # Dovecot PLAIN
+    dovecot_plain:
+        driver = dovecot
+        public_name = PLAIN
+        server_socket = /var/run/dovecot/auth-client
+        server_set_id = $auth1
